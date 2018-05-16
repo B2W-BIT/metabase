@@ -1,11 +1,7 @@
 (ns metabase.integrations.ldap-test
   (:require [expectations :refer :all]
             [metabase.integrations.ldap :as ldap]
-            (metabase.test [util :refer [resolve-private-vars]])
-            (metabase.test.integrations [ldap :refer [expect-with-ldap-server get-ldap-port]])))
-
-(resolve-private-vars metabase.integrations.ldap escape-value settings->ldap-options get-connection get-user-groups)
-
+            [metabase.test.integrations.ldap :refer [expect-with-ldap-server get-ldap-port]]))
 
 (defn- get-ldap-details []
   {:host       "localhost"
@@ -20,12 +16,17 @@
 
 (expect
   "\\2AJohn \\28Dude\\29 Doe\\5C"
-  (escape-value "*John (Dude) Doe\\"))
+  (#'ldap/escape-value "*John (Dude) Doe\\"))
 
 ;; The connection test should pass with valid settings
 (expect-with-ldap-server
   {:status :SUCCESS}
   (ldap/test-ldap-connection (get-ldap-details)))
+
+;; The connection test should allow anonymous binds
+(expect-with-ldap-server
+  {:status :SUCCESS}
+  (ldap/test-ldap-connection (dissoc (get-ldap-details) :bind-dn)))
 
 ;; The connection test should fail with an invalid user search base
 (expect-with-ldap-server
@@ -49,8 +50,8 @@
 
 ;; Make sure the basic connection stuff works, this will throw otherwise
 (expect-with-ldap-server
-  nil
-  (.close (get-connection)))
+ nil
+ (.close (#'ldap/get-connection)))
 
 ;; Login with everything right should succeed
 (expect-with-ldap-server

@@ -1,14 +1,26 @@
 (ns metabase.api.dataset-test
   "Unit tests for /api/dataset endpoints."
-  (:require [expectations :refer :all]
+  (:require [cheshire
+             [core :as json]
+             [generate :as generate]]
+            [clojure.data.csv :as csv]
+            [clojure.java.jdbc :as jdbc]
+            [dk.ative.docjure.spreadsheet :as spreadsheet]
+            [expectations :refer :all]
             [medley.core :as m]
-            [metabase.api.dataset :refer [default-query-constraints]]
-            [metabase.models.query-execution :refer [QueryExecution]]
-            [metabase.query-processor.expand :as ql]
+            [metabase.models
+             [database :refer [Database]]
+             [query-execution :refer [QueryExecution]]]
+            [metabase.query-processor :as qp]
+            [metabase.query-processor.middleware.expand :as ql]
+            [metabase.sync :as sync]
             [metabase.test
              [data :refer :all]
              [util :as tu]]
-            [metabase.test.data.users :refer :all]
+            [metabase.test.data
+             [datasets :refer [expect-with-engine]]
+             [dataset-definitions :as defs]
+             [users :refer :all]]
             [toucan.db :as db]))
 
 (defn user-details [user]
@@ -33,7 +45,7 @@
                              (.endsWith (name k) "_id"))
                  (if (or (= :created_at k)
                          (= :updated_at k))
-                   [k (not (nil? v))]
+                   [k (some? v)]
                    [k (f v)]))))))
 
 (defn format-response [m]
@@ -54,7 +66,7 @@
    {:data                   {:rows    [[1000]]
                              :columns ["count"]
                              :cols    [{:base_type "type/Integer", :special_type "type/Number", :name "count", :display_name "count", :id nil, :table_id nil,
-                                        :description nil, :target nil, :extra_info {}, :source "aggregation"}]
+                                        :description nil, :target nil, :extra_info {}, :source "aggregation", :remapped_from nil, :remapped_to nil}]
                              :native_form true}
     :row_count              1
     :status                 "completed"
@@ -64,7 +76,7 @@
                                     (ql/aggregation (ql/count))))
                                 (assoc :type "query")
                                 (assoc-in [:query :aggregation] [{:aggregation-type "count", :custom-name nil}])
-                                (assoc :constraints default-query-constraints))
+                                (assoc :constraints qp/default-query-constraints))
     :started_at             true
     :running_time           true
     :average_execution_time nil}
@@ -102,7 +114,7 @@
     :json_query   {:database    (id)
                    :type        "native"
                    :native      {:query "foobar"}
-                   :constraints default-query-constraints}
+                   :constraints qp/default-query-constraints}
     :started_at   true
     :running_time true}
    ;; QueryExecution entry in the DB
@@ -128,3 +140,82 @@
                                                                         :native   {:query "foobar"}})]
     [(check-error-message (format-response result))
      (check-error-message (format-response (most-recent-query-execution)))]))
+
+
+;;; Make sure that we're piggybacking off of the JSON encoding logic when encoding strange values in XLSX (#5145, #5220, #5459)
+(defrecord ^:private SampleNastyClass [^String v])
+
+(generate/add-encoder
+ SampleNastyClass
+ (fn [obj, ^com.fasterxml.jackson.core.JsonGenerator json-generator]
+   (.writeString json-generator (:v obj))))
+
+(defrecord ^:private AnotherNastyClass [^String v])
+
+(expect
+  [{"Values" "values"}
+   {"Values" "Hello XLSX World!"}   ; should use the JSON encoding implementation for object
+   {"Values" "{:v \"No Encoder\"}"} ; fall back to the implementation of `str` for an object if no JSON encoder exists rather than barfing
+   {"Values" "ABC"}]
+  (->> (spreadsheet/create-workbook "Results" [["values"]
+                                               [(SampleNastyClass. "Hello XLSX World!")]
+                                               [(AnotherNastyClass. "No Encoder")]
+                                               ["ABC"]])
+       (spreadsheet/select-sheet "Results")
+       (spreadsheet/select-columns {:A "Values"})))
+
+(defn- parse-and-sort-csv [response]
+  (sort-by
+   ;; ID in CSV is a string, parse it and sort it to get the first 5
+   (comp #(Integer/parseInt %) first)
+   ;; First row is the header
+   (rest (csv/read-csv response))))
+
+;; Date columns should be emitted without time
+(expect
+  [["1" "2014-04-07" "5" "12"]
+   ["2" "2014-09-18" "1" "31"]
+   ["3" "2014-09-15" "8" "56"]
+   ["4" "2014-03-11" "5" "4"]
+   ["5" "2013-05-05" "3" "49"]]
+  (let [result ((user->client :rasta) :post 200 "dataset/csv" :query
+                (json/generate-string (wrap-inner-query
+                                        (query checkins))))]
+    (take 5 (parse-and-sort-csv result))))
+
+;; Check an empty date column
+(expect
+  [["1" "2014-04-07" "" "5" "12"]
+   ["2" "2014-09-18" "" "1" "31"]
+   ["3" "2014-09-15" "" "8" "56"]
+   ["4" "2014-03-11" "" "5" "4"]
+   ["5" "2013-05-05" "" "3" "49"]]
+  (with-db (get-or-create-database! defs/test-data-with-null-date-checkins)
+    (let [result ((user->client :rasta) :post 200 "dataset/csv" :query
+                  (json/generate-string (wrap-inner-query
+                                          (query checkins))))]
+      (take 5 (parse-and-sort-csv result)))))
+
+;; SQLite doesn't return proper date objects but strings, they just pass through the qp untouched
+(expect-with-engine :sqlite
+  [["1" "2014-04-07" "5" "12"]
+   ["2" "2014-09-18" "1" "31"]
+   ["3" "2014-09-15" "8" "56"]
+   ["4" "2014-03-11" "5" "4"]
+   ["5" "2013-05-05" "3" "49"]]
+  (let [result ((user->client :rasta) :post 200 "dataset/csv" :query
+                (json/generate-string (wrap-inner-query
+                                        (query checkins))))]
+    (take 5 (parse-and-sort-csv result))))
+
+;; DateTime fields are untouched when exported
+(expect
+  [["1" "Plato Yeshua" "2014-04-01T08:30:00.000Z"]
+   ["2" "Felipinho Asklepios" "2014-12-05T15:15:00.000Z"]
+   ["3" "Kaneonuskatew Eiran" "2014-11-06T16:15:00.000Z"]
+   ["4" "Simcha Yan" "2014-01-01T08:30:00.000Z"]
+   ["5" "Quentin Sören" "2014-10-03T17:30:00.000Z"]]
+  (let [result ((user->client :rasta) :post 200 "dataset/csv" :query
+                (json/generate-string (wrap-inner-query
+                                        (query users))))]
+    (take 5 (parse-and-sort-csv result))))

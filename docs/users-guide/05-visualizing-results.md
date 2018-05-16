@@ -9,6 +9,7 @@ In Metabase, an answer to a question can be visualized in a number of ways:
 * Table
 * Line chart
 * Bar chart
+* Row chart
 * Area chart
 * Scatterplot or bubble chart
 * Pie/donut chart
@@ -43,13 +44,30 @@ The Table option is good for looking at tabular data (duh), or for lists of thin
 ![Pivot table](images/visualizations/pivot.png)
 
 #### Line, bar, and area charts
-Line charts are best for displaying the trend of a number over time, especially when you have lots of x-axis values. Bar charts are great for displaying a metric grouped by a category (e.g., the number of users you have by country), and they can also be useful for showing a number over time if you have a smaller number of x-axis values (like orders per month this year).
+Line charts are best for displaying the trend of a number over time, especially when you have lots of x-axis values. Bar charts are great for displaying a number grouped by a category (e.g., the number of users you have by country), and they can also be useful for showing a number over time if you have a smaller number of x-axis values (like orders per month this year).
 
 ![Bar chart](images/visualizations/bar.png)
 
-Area charts are useful when comparing the the proportions between two metrics over time. Both bar and area charts can be stacked.
+Area charts are useful when comparing the proportions of two metrics over time. Both bar and area charts can be stacked.
 
 ![Stacked area chart](images/visualizations/area.png)
+
+#### Row charts
+If you're trying to group a number by a field that has a lot of possible values, like a Vendor or Product Title field, try visualizing it as a row chart. Metabase will show you the bars in descending order of size, with a final bar at the bottom for items that didn't fit.
+
+![Row chart](images/visualizations/row.png)
+
+##### Histograms
+
+If you have a bar chart like Count of Users by Age, where the x-axis is a number, you'll get a special kind of chart called a **histogram**, where each bar represents a range of values (called a "bin"). Note that Metabase will automatically bin your results any time you use a number as a grouping, even if you aren't viewing a bar chart. Questions that use latitude and longitude will also get binned automatically.
+
+![Histogram](images/histogram.png)
+
+By default, Metabase will automatically choose a good way to bin your results. But you can change how many bins your result has, or turn the binning off entirely, by clicking on the number field you're grouping by in the Question Builder, then clicking on the area to the right of the field name:
+
+![Binning options](images/binning.png)
+
+##### Options for line, bar, and area charts
 
 These three charting types have very similar options, which are broken up into the following:
 

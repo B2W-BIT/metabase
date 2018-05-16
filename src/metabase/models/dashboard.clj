@@ -1,5 +1,10 @@
 (ns metabase.models.dashboard
-  (:require [clojure.data :refer [diff]]
+  (:require [clojure
+             [data :refer [diff]]
+             [set :as set]
+             [string :as str]]
+            [clojure.tools.logging :as log]
+            [metabase.automagic-dashboards.populate :as magic.populate]
             [metabase
              [events :as events]
              [public-settings :as public-settings]
@@ -7,43 +12,74 @@
             [metabase.models
              [card :as card :refer [Card]]
              [dashboard-card :as dashboard-card :refer [DashboardCard]]
+             [field-values :as field-values]
              [interface :as i]
+             [params :as params]
              [revision :as revision]]
+            [metabase.query-processor :as qp]
+            [metabase.query-processor.interface :as qpi]
             [metabase.models.revision.diff :refer [build-sentence]]
             [toucan
              [db :as db]
              [hydrate :refer [hydrate]]
              [models :as models]]))
 
-;;; ---------------------------------------- Perms Checking ----------------------------------------
+;;; ------------------------------------------------- Perms Checking -------------------------------------------------
 
 (defn- dashcards->cards [dashcards]
   (when (seq dashcards)
     (for [dashcard dashcards
+          :when    (:card dashcard) ; skip over ones that are cardless, e.g. text-only DashCards
           card     (cons (:card dashcard) (:series dashcard))]
       card)))
 
-(defn- can-read? [dashboard]
-  ;; if Dashboard is already hydrated no need to do it a second time
-  (let [cards (or (dashcards->cards (:ordered_cards dashboard))
-                  (dashcards->cards (-> (db/select [DashboardCard :id :card_id], :dashboard_id (u/get-id dashboard))
-                                        (hydrate :card :series))))]
-    (or (empty? cards)
-        (some i/can-read? cards))))
+(defn- can-read? [{public-uuid :public_uuid, :as dashboard}]
+  (or
+   ;; if the Dashboard is shared publicly then there is simply no need to check permissions for it because people
+   ;; can see it already!!!
+   (and (public-settings/enable-public-sharing)
+        (some? public-uuid))
+   ;; if Dashboard is already hydrated no need to do it a second time
+   (let [cards (or (dashcards->cards (:ordered_cards dashboard))
+                   (dashcards->cards (-> (db/select [DashboardCard :id :card_id]
+                                           :dashboard_id (u/get-id dashboard)
+                                           :card_id      [:not= nil]) ; skip text-only Cards
+                                         (hydrate [:card :in_public_dashboard] :series))))]
+     (or (empty? cards)
+         (some i/can-read? cards)))))
 
 
-;;; ---------------------------------------- Entity & Lifecycle ----------------------------------------
+;;; --------------------------------------------------- Hydration ----------------------------------------------------
+
+(defn ordered-cards
+  "Return the `DashboardCards` associated with DASHBOARD, in the order they were created."
+  {:hydrate :ordered_cards}
+  [dashboard-or-id]
+  (db/do-post-select DashboardCard
+    (db/query {:select    [:dashcard.*]
+               :from      [[DashboardCard :dashcard]]
+               :left-join [[Card :card] [:= :dashcard.card_id :card.id]]
+               :where     [:and
+                           [:= :dashcard.dashboard_id (u/get-id dashboard-or-id)]
+                           [:or
+                            [:= :card.archived false]
+                            [:= :card.archived nil]]] ; e.g. DashCards with no corresponding Card, e.g. text Cards
+               :order-by  [[:dashcard.created_at :asc]]})))
+
+
+;;; ----------------------------------------------- Entity & Lifecycle -----------------------------------------------
+
+(models/defmodel Dashboard :report_dashboard)
+
 
 (defn- pre-delete [dashboard]
   (db/delete! 'Revision :model "Dashboard" :model_id (u/get-id dashboard))
   (db/delete! DashboardCard :dashboard_id (u/get-id dashboard)))
 
 (defn- pre-insert [dashboard]
-  (let [defaults {:parameters   []}]
+  (let [defaults {:parameters []}]
     (merge defaults dashboard)))
 
-
-(models/defmodel Dashboard :report_dashboard)
 
 (u/strict-extend (class Dashboard)
   models/IModel
@@ -59,38 +95,7 @@
           :can-write? can-read?}))
 
 
-;;; ---------------------------------------- Hydration ----------------------------------------
-
-(defn ordered-cards
-  "Return the `DashboardCards` associated with DASHBOARD, in the order they were created."
-  {:hydrate :ordered_cards}
-  [dashboard]
-  (db/do-post-select DashboardCard
-    (db/query {:select   [:dashcard.*]
-               :from     [[DashboardCard :dashcard]]
-               :join     [[Card :card] [:= :dashcard.card_id :card.id]]
-               :where    [:and [:= :dashcard.dashboard_id (u/get-id dashboard)]
-                               [:= :card.archived false]]
-               :order-by [[:dashcard.created_at :asc]]})))
-
-
-;;; ## ---------------------------------------- PERSISTENCE FUNCTIONS ----------------------------------------
-
-(defn create-dashboard!
-  "Create a `Dashboard`"
-  [{:keys [name description parameters], :as dashboard} user-id]
-  {:pre [(map? dashboard)
-         (u/maybe? u/sequence-of-maps? parameters)
-         (integer? user-id)]}
-  (->> (db/insert! Dashboard
-         :name        name
-         :description description
-         :parameters  (or parameters [])
-         :creator_id  user-id)
-       (events/publish-event! :dashboard-create)))
-
-
-;;; ## ---------------------------------------- REVISIONS ----------------------------------------
+;;; --------------------------------------------------- Revisions ----------------------------------------------------
 
 (defn serialize-dashboard
   "Serialize a `Dashboard` for use in a `Revision`."
@@ -168,3 +173,126 @@
          {:serialize-instance  (fn [_ _ dashboard] (serialize-dashboard dashboard))
           :revert-to-revision! (u/drop-first-arg revert-dashboard!)
           :diff-str            (u/drop-first-arg diff-dashboards-str)}))
+
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                                 OTHER CRUD FNS                                                 |
+;;; +----------------------------------------------------------------------------------------------------------------+
+
+(defn- dashboard-id->param-field-ids
+  "Get the set of Field IDs referenced by the parameters in this Dashboard."
+  [dashboard-or-id]
+  (let [dash (Dashboard (u/get-id dashboard-or-id))]
+    (params/dashboard->param-field-ids (hydrate dash [:ordered_cards :card]))))
+
+
+(defn- update-field-values-for-on-demand-dbs!
+  "If the parameters have changed since last time this dashboard was saved, we need to update the FieldValues
+   for any Fields that belong to an 'On-Demand' synced DB."
+  [dashboard-or-id old-param-field-ids new-param-field-ids]
+  (when (and (seq new-param-field-ids)
+             (not= old-param-field-ids new-param-field-ids))
+    (let [newly-added-param-field-ids (set/difference new-param-field-ids old-param-field-ids)]
+      (log/info "Referenced Fields in Dashboard params have changed: Was:" old-param-field-ids
+                "Is Now:" new-param-field-ids
+                "Newly Added:" newly-added-param-field-ids)
+      (field-values/update-field-values-for-on-demand-dbs! newly-added-param-field-ids))))
+
+
+(defn add-dashcard!
+  "Add a Card to a Dashboard.
+   This function is provided for convenience and also makes sure various cleanup steps are performed when finished,
+   for example updating FieldValues for On-Demand DBs.
+   Returns newly created DashboardCard."
+  {:style/indent 2}
+  [dashboard-or-id card-or-id-or-nil & [dashcard-options]]
+  (let [old-param-field-ids (dashboard-id->param-field-ids dashboard-or-id)
+        dashboard-card      (-> (assoc dashcard-options
+                                  :dashboard_id (u/get-id dashboard-or-id)
+                                  :card_id      (when card-or-id-or-nil (u/get-id card-or-id-or-nil)))
+                                ;; if :series info gets passed in make sure we pass it along as a sequence of IDs
+                                (update :series #(filter identity (map u/get-id %))))]
+    (u/prog1 (dashboard-card/create-dashboard-card! dashboard-card)
+      (let [new-param-field-ids (dashboard-id->param-field-ids dashboard-or-id)]
+        (update-field-values-for-on-demand-dbs! dashboard-or-id old-param-field-ids new-param-field-ids)))))
+
+(defn update-dashcards!
+  "Update the DASHCARDS belonging to DASHBOARD-OR-ID.
+   This function is provided as a convenience instead of doing this yourself; it also makes sure various cleanup steps
+   are performed when finished, for example updating FieldValues for On-Demand DBs.
+   Returns `nil`."
+  {:style/indent 1}
+  [dashboard-or-id dashcards]
+  (let [old-param-field-ids (dashboard-id->param-field-ids dashboard-or-id)
+        dashcard-ids        (db/select-ids DashboardCard, :dashboard_id (u/get-id dashboard-or-id))]
+    (doseq [{dashcard-id :id, :as dashboard-card} dashcards]
+      ;; ensure the dashcard we are updating is part of the given dashboard
+      (when (contains? dashcard-ids dashcard-id)
+        (dashboard-card/update-dashboard-card! (update dashboard-card :series #(filter identity (map :id %))))))
+    (let [new-param-field-ids (dashboard-id->param-field-ids dashboard-or-id)]
+      (update-field-values-for-on-demand-dbs! dashboard-or-id old-param-field-ids new-param-field-ids))))
+
+
+(defn- result-metadata-for-query
+  "Fetch the results metadata for a QUERY by running the query and seeing what the QP gives us in return."
+  [query]
+  (binding [qpi/*disable-qp-logging* true]
+    (get-in (qp/process-query query) [:data :results_metadata :columns])))
+
+(defn- save-card!
+  [card]
+  (when (-> card :dataset_query not-empty)
+    (let [card (db/insert! 'Card
+                 (-> card
+                     (update :result_metadata #(or % (-> card
+                                                         :dataset_query
+                                                         result-metadata-for-query)))
+                     (dissoc :id)))]
+      (events/publish-event! :card-create card)
+      (hydrate card :creator :dashboard_count :labels :can_write :collection))))
+
+(defn- applied-filters-blurb
+  [applied-filters]
+  (some->> applied-filters
+           not-empty
+           (map (fn [{:keys [field value]}]
+                  (format "%s %s" (str/join " " field) value)))
+           (str/join ", ")
+           (str "Filtered by: ")))
+
+(defn- ensure-unique-collection-name
+  [collection]
+  (let [c (db/count 'Collection :name [:like (format "%s%%" collection)])]
+    (if (zero? c)
+      collection
+      (format "%s %s" collection (inc c)))))
+
+(defn save-transient-dashboard!
+  "Save a denormalized description of dashboard."
+  [dashboard]
+  (let [dashcards  (:ordered_cards dashboard)
+        dashboard  (db/insert! Dashboard
+                     (-> dashboard
+                         (dissoc :ordered_cards :rule :related :transient_name
+                                 :transient_filters)
+                         (assoc :description (->> dashboard
+                                                  :transient_filters
+                                                  applied-filters-blurb))))
+        collection (magic.populate/create-collection!
+                    (ensure-unique-collection-name
+                     (format "Questions for the dashboard \"%s\"" (:name dashboard)))
+                    (rand-nth magic.populate/colors)
+                    "Automatically generated cards.")]
+    (doseq [dashcard dashcards]
+      (let [card     (some-> dashcard :card (assoc :collection_id (:id collection)) save-card!)
+            series   (some->> dashcard :series (map (fn [card]
+                                                      (-> card
+                                                          (assoc :collection_id (:id collection))
+                                                          save-card!))))
+            dashcard (-> dashcard
+                         (dissoc :card :id :card_id)
+                         (update :parameter_mappings
+                                 (partial map #(assoc % :card_id (:id card))))
+                         (assoc :series series))]
+        (add-dashcard! dashboard card dashcard)))
+    dashboard))

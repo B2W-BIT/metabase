@@ -1,10 +1,25 @@
 (ns metabase.query-processor.middleware.fetch-source-query
-  (:require [clojure.tools.logging :as log]
+  "Middleware responsible for 'hydrating' the source query for queries that use another query as their source."
+  (:require [clojure.string :as str]
+            [clojure.tools.logging :as log]
             [metabase.query-processor
              [interface :as i]
              [util :as qputil]]
             [metabase.util :as u]
+            [puppetlabs.i18n.core :refer [trs]]
             [toucan.db :as db]))
+
+(defn- trim-query
+  "Native queries can have trailing SQL comments. This works when executed directly, but when we use the query in a
+  nested query, we wrap it in another query, which can cause the last part of the query to be unintentionally
+  commented out, causing it to fail. This function removes any trailing SQL comment."
+  [card-id query-str]
+  (let [trimmed-string (str/replace query-str #"--.*(\n|$)" "")]
+    (if (= query-str trimmed-string)
+      query-str
+      (do
+        (log/info (trs "Trimming trailing comment from card with id {0}" card-id))
+        trimmed-string))))
 
 (defn- card-id->source-query
   "Return the source query info for Card with CARD-ID."
@@ -13,10 +28,11 @@
         card-query (:dataset_query card)]
     (assoc (or (:query card-query)
                (when-let [native (:native card-query)]
-                 {:native        (:query native)
+                 {:native        (trim-query card-id (:query native))
                   :template_tags (:template_tags native)})
                (throw (Exception. (str "Missing source query in Card " card-id))))
-      ;; include database ID as well; we'll pass that up the chain so it eventually gets put in its spot in the outer-query
+      ;; include database ID as well; we'll pass that up the chain so it eventually gets put in its spot in the
+      ;; outer-query
       :database (:database card-query))))
 
 (defn- source-table-str->source-query
@@ -28,8 +44,8 @@
         (log/info "\nFETCHED SOURCE QUERY FROM CARD" card-id-str ":\n" (u/pprint-to-str 'yellow <>))))))
 
 (defn- expand-card-source-tables
-  "If `source-table` is a Card reference (a string like `card__100`) then replace that with appropriate `:source-query` information.
-   Does nothing if `source-table` is a normal ID. Recurses for nested-nested queries."
+  "If `source-table` is a Card reference (a string like `card__100`) then replace that with appropriate
+  `:source-query` information. Does nothing if `source-table` is a normal ID. Recurses for nested-nested queries."
   [inner-query]
   (let [source-table (qputil/get-normalized inner-query :source-table)]
     (if-not (string? source-table)
@@ -39,7 +55,8 @@
         (-> inner-query
             ;; remove `source-table` `card__id` key
             (qputil/dissoc-normalized :source-table)
-            ;; Add new `source-query` info in its place. Pass the database ID up the chain, removing it from the source query
+            ;; Add new `source-query` info in its place. Pass the database ID up the chain, removing it from the
+            ;; source query
             (assoc
               :source-query (dissoc source-query :database)
               :database     (:database source-query)))))))
@@ -56,6 +73,7 @@
                {:database database})))))
 
 (defn fetch-source-query
-  "Middleware that assocs the `:source-query` for this query if it was specified using the shorthand `:source-table` `card__n` format."
+  "Middleware that assocs the `:source-query` for this query if it was specified using the shorthand `:source-table`
+  `card__n` format."
   [qp]
   (comp qp fetch-source-query*))

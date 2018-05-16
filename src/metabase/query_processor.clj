@@ -1,5 +1,6 @@
 (ns metabase.query-processor
-  "Preprocessor that does simple transformations to all incoming queries, simplifing the driver-specific implementations."
+  "Preprocessor that does simple transformations to all incoming queries, simplifing the driver-specific
+  implementations."
   (:require [clojure.tools.logging :as log]
             [metabase
              [driver :as driver]
@@ -8,17 +9,19 @@
              [query :as query]
              [query-execution :as query-execution :refer [QueryExecution]]]
             [metabase.query-processor.middleware
+             [add-dimension-projections :as add-dim]
              [add-implicit-clauses :as implicit-clauses]
              [add-row-count-and-status :as row-count-and-status]
              [add-settings :as add-settings]
              [annotate-and-sort :as annotate-and-sort]
+             [binning :as binning]
              [cache :as cache]
              [catch-exceptions :as catch-exceptions]
              [cumulative-aggregations :as cumulative-ags]
              [dev :as dev]
              [driver-specific :as driver-specific]
+             [expand :as expand]
              [expand-macros :as expand-macros]
-             [expand-resolve :as expand-resolve]
              [fetch-source-query :as fetch-source-query]
              [format-rows :as format-rows]
              [limit :as limit]
@@ -27,7 +30,9 @@
              [parameters :as parameters]
              [permissions :as perms]
              [results-metadata :as results-metadata]
-             [resolve-driver :as resolve-driver]]
+             [resolve-driver :as resolve-driver]
+             [resolve :as resolve]
+             [source-table :as source-table]]
             [metabase.query-processor.util :as qputil]
             [metabase.util.schema :as su]
             [schema.core :as s]
@@ -38,14 +43,15 @@
 ;;; +-------------------------------------------------------------------------------------------------------+
 
 (defn- execute-query
-  "The pivotal stage of the `process-query` pipeline where the query is actually executed by the driver's Query Processor methods.
-   This function takes the fully pre-processed query, runs it, and returns the results, which then run through the various
-   post-processing steps."
+  "The pivotal stage of the `process-query` pipeline where the query is actually executed by the driver's Query
+  Processor methods. This function takes the fully pre-processed query, runs it, and returns the results, which then
+  run through the various post-processing steps."
   [query]
   {:pre [(map? query) (:driver query)]}
   (driver/execute-query (:driver query) query))
 
-;; The way these functions are applied is actually straight-forward; it matches the middleware pattern used by Compojure.
+;; The way these functions are applied is actually straight-forward; it matches the middleware pattern used by
+;; Compojure.
 ;;
 ;; (defn- qp-middleware-fn [qp]
 ;;   (fn [query]
@@ -56,9 +62,10 @@
 ;; This returned function *pre-processes* QUERY as needed, and then passes it to QP.
 ;; The function may then *post-process* the results of (QP QUERY) as neeeded, and returns the results.
 ;;
-;; Many functions do both pre and post-processing; this middleware pattern allows them to return closures that maintain some sort of
-;; internal state. For example, `cumulative-sum` can determine if it needs to perform cumulative summing, and, if so, modify the query
-;; before passing it to QP; once the query is processed, it can use modify the results as needed.
+;; Many functions do both pre and post-processing; this middleware pattern allows them to return closures that
+;; maintain some sort of internal state. For example, `cumulative-sum` can determine if it needs to perform cumulative
+;; summing, and, if so, modify the query before passing it to QP; once the query is processed, it can use modify the
+;; results as needed.
 ;;
 ;; PRE-PROCESSING fns are applied from bottom to top, and POST-PROCESSING from top to bottom;
 ;; the easiest way to wrap your head around this is picturing a the query as a ball being thrown in the air
@@ -72,8 +79,8 @@
 
      (post-process (f (pre-process query)))
 
-   Normally F is something that runs the query, like the `execute-query` function above, but this can be swapped out when we want to do things like
-   process a query without actually running it."
+   Normally F is something that runs the query, like the `execute-query` function above, but this can be swapped out
+   when we want to do things like process a query without actually running it."
   [f]
   ;; ▼▼▼ POST-PROCESSING ▼▼▼  happens from TOP-TO-BOTTOM, e.g. the results of `f` are (eventually) passed to `limit`
   (-> f
@@ -85,10 +92,14 @@
       dev/check-results-format
       limit/limit
       cumulative-ags/handle-cumulative-aggregations
-      implicit-clauses/add-implicit-clauses
       format-rows/format-rows
+      binning/update-binning-strategy
       results-metadata/record-and-return-metadata!
-      expand-resolve/expand-resolve                    ; ▲▲▲ QUERY EXPANSION POINT  ▲▲▲ All functions *above* will see EXPANDED query during PRE-PROCESSING
+      resolve/resolve-middleware
+      add-dim/add-remapping
+      implicit-clauses/add-implicit-clauses
+      source-table/resolve-source-table-middleware
+      expand/expand-middleware                         ; ▲▲▲ QUERY EXPANSION POINT  ▲▲▲ All functions *above* will see EXPANDED query during PRE-PROCESSING
       row-count-and-status/add-row-count-and-status    ; ▼▼▼ RESULTS WRAPPING POINT ▼▼▼ All functions *below* will see results WRAPPED in `:data` during POST-PROCESSING
       parameters/substitute-parameters
       expand-macros/expand-macros
@@ -103,7 +114,8 @@
 ;; ▲▲▲ PRE-PROCESSING ▲▲▲ happens from BOTTOM-TO-TOP, e.g. the results of `expand-macros` are (eventually) passed to `expand-resolve`
 
 (defn query->native
-  "Return the native form for QUERY (e.g. for a MBQL query on Postgres this would return a map containing the compiled SQL form)."
+  "Return the native form for QUERY (e.g. for a MBQL query on Postgres this would return a map containing the compiled
+  SQL form)."
   {:style/indent 0}
   [query]
   (let [results ((qp-pipeline identity) query)]
@@ -121,11 +133,16 @@
   "Expand a QUERY the same way it would normally be done as part of query processing.
    This is useful for things that need to look at an expanded query, such as permissions checking for Cards."
   (->> identity
-       expand-resolve/expand-resolve
+       resolve/resolve-middleware
+       source-table/resolve-source-table-middleware
+       expand/expand-middleware
        parameters/substitute-parameters
        expand-macros/expand-macros
+       driver-specific/process-query-in-context
+       resolve-driver/resolve-driver
        fetch-source-query/fetch-source-query))
-;; ▲▲▲ This only does PRE-PROCESSING, so it happens from bottom to top, eventually returning the preprocessed query instead of running it
+;; ▲▲▲ This only does PRE-PROCESSING, so it happens from bottom to top, eventually returning the preprocessed query
+;; instead of running it
 
 
 ;;; +----------------------------------------------------------------------------------------------------+
@@ -172,7 +189,8 @@
                                                (:start_time_millis query-execution))
                               :result_rows  (get query-result :row_count 0))
                             (dissoc :start_time_millis))]
-    ;; only insert a new record into QueryExecution if the results *were not* cached (i.e., only if a Query was actually ran)
+    ;; only insert a new record into QueryExecution if the results *were not* cached (i.e., only if a Query was
+    ;; actually ran)
     (when-not (:cached query-result)
       (save-query-execution! query-execution))
     ;; ok, now return the results in the normal response format
@@ -193,9 +211,9 @@
     (throw (Exception. (str (get query-result :error "general error"))))))
 
 (def ^:dynamic ^Boolean *allow-queries-with-no-executor-id*
-  "Should we allow running queries (via `dataset-query`) without specifying the `executed-by` User ID?
-   By default this is `false`, but this constraint can be disabled for running queries not executed by a specific user
-   (e.g., public Cards)."
+  "Should we allow running queries (via `dataset-query`) without specifying the `executed-by` User ID?  By default
+  this is `false`, but this constraint can be disabled for running queries not executed by a specific user
+  (e.g., public Cards)."
   false)
 
 (defn- query-execution-info
@@ -217,7 +235,8 @@
    :start_time_millis (System/currentTimeMillis)})
 
 (defn- run-and-save-query!
-  "Run QUERY and save appropriate `QueryExecution` info, and then return results (or an error message) in the usual format."
+  "Run QUERY and save appropriate `QueryExecution` info, and then return results (or an error message) in the usual
+  format."
   [query]
   (let [query-execution (query-execution-info query)]
     (try
@@ -225,7 +244,9 @@
         (assert-query-status-successful result)
         (save-and-return-successful-query! query-execution result))
       (catch Throwable e
-        (log/warn (u/format-color 'red "Query failure: %s\n%s" (.getMessage e) (u/pprint-to-str (u/filtered-stacktrace e))))
+        (log/warn (u/format-color 'red "Query failure: %s\n%s"
+                    (.getMessage e)
+                    (u/pprint-to-str (u/filtered-stacktrace e))))
         (save-and-return-failed-query! query-execution (.getMessage e))))))
 
 (def ^:private DatasetQueryOptions
@@ -245,7 +266,7 @@
                        *allow-queries-with-no-executor-id*))
                  "executed-by cannot be nil unless *allow-queries-with-no-executor-id* is true"))
 
-(s/defn ^:always-validate process-query-and-save-execution!
+(s/defn process-query-and-save-execution!
   "Process and run a json based dataset query and return results.
 
   Takes 2 arguments:
@@ -262,3 +283,22 @@
   (run-and-save-query! (assoc query :info (assoc options
                                             :query-hash (qputil/query-hash query)
                                             :query-type (if (qputil/mbql-query? query) "MBQL" "native")))))
+
+(def ^:private ^:const max-results-bare-rows
+  "Maximum number of rows to return specifically on :rows type queries via the API."
+  2000)
+
+(def ^:private ^:const max-results
+  "General maximum number of rows to return from an API query."
+  10000)
+
+(def default-query-constraints
+  "Default map of constraints that we apply on dataset queries executed by the api."
+  {:max-results           max-results
+   :max-results-bare-rows max-results-bare-rows})
+
+(s/defn process-query-and-save-with-max!
+  "Same as `process-query-and-save-execution!` but will include the default max rows returned as a constraint"
+  {:style/indent 1}
+  [query, options :- DatasetQueryOptions]
+  (process-query-and-save-execution! (assoc query :constraints default-query-constraints) options))

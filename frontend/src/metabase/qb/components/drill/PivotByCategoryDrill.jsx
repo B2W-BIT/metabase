@@ -3,12 +3,10 @@
 import PivotByCategoryAction from "../actions/PivotByCategoryAction";
 
 import type {
-    ClickAction,
-    ClickActionProps
+  ClickAction,
+  ClickActionProps,
 } from "metabase/meta/types/Visualization";
 
-export default (
-    { card, tableMetadata, clicked }: ClickActionProps
-): ClickAction[] => {
-    return PivotByCategoryAction({ card, tableMetadata, clicked });
+export default (props: ClickActionProps): ClickAction[] => {
+  return PivotByCategoryAction(props);
 };

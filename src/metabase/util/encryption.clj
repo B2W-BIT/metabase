@@ -27,9 +27,13 @@
       (secret-key->hash secret-key))))
 
 ;; log a nice message letting people know whether DB details encryption is enabled
-(log/info (format "DB details encryption is %s for this Metabase instance. %s"
-                  (if default-secret-key "ENABLED" "DISABLED")
-                  (u/emoji (if default-secret-key "🔐" "🔓"))))
+(log/info
+ (format "DB details encryption is %s for this Metabase instance. %s"
+         (if default-secret-key "ENABLED" "DISABLED")
+         (u/emoji (if default-secret-key "🔐" "🔓")))
+ "\nSee"
+ "http://www.metabase.com/docs/latest/operations-guide/start.html#encrypting-your-database-connection-details-at-rest"
+ "for more information.")
 
 (defn encrypt
   "Encrypt string S as hex bytes using a SECRET-KEY (a 64-byte byte array), by default the hashed value of `MB_ENCRYPTION_SECRET_KEY`."
@@ -69,7 +73,7 @@
      (try
        (decrypt secret-key s)
        (catch Throwable e
-         (if (u/base-64-string? s)
+         (if (u/base64-string? s)
            ;; if we can't decrypt `s`, but it *is* encrypted, log an error message and return `nil`
            (log/error "Cannot decrypt encrypted details. Have you changed or forgot to set MB_ENCRYPTION_SECRET_KEY?" (.getMessage e))
            ;; otherwise return S without decrypting. It's probably not decrypted in the first place

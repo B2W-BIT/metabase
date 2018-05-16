@@ -7,13 +7,22 @@
              [query-processor :as qp]
              [query-processor-test :refer :all]
              [util :as u]]
+            [metabase.driver.generic-sql :as generic-sql]
             [metabase.models
-             [card :refer [Card]]
-             [database :as database]
+             [card :as card :refer [Card]]
+             [database :as database :refer [Database]]
              [field :refer [Field]]
+             [permissions :as perms]
+             [permissions-group :as perms-group]
+             [segment :refer [Segment]]
              [table :refer [Table]]]
-            [metabase.test.data :as data]
-            [metabase.test.data.datasets :as datasets]
+            [metabase.test
+             [data :as data]
+             [util :as tu]]
+            [metabase.test.data
+             [datasets :as datasets]
+             [dataset-definitions :as defs]
+             [users :refer [create-users-if-needed! user->client]]]
             [toucan.db :as db]
             [toucan.util.test :as tt]))
 
@@ -29,7 +38,7 @@
 
 
 ;; make sure we can do a basic query with MBQL source-query
-(datasets/expect-with-engines (engines-that-support :nested-queries)
+(datasets/expect-with-engines (non-timeseries-engines-with-feature :nested-queries)
   {:rows [[1 "Red Medicine"                  4 10.0646 -165.374 3]
           [2 "Stout Burgers & Beers"        11 34.0996 -118.329 2]
           [3 "The Apple Pan"                11 34.0406 -118.428 2]
@@ -37,32 +46,42 @@
           [5 "Brite Spot Family Restaurant" 20 34.0778 -118.261 2]]
    :cols [{:name "id",          :base_type (data/id-field-type)}
           {:name "name",        :base_type :type/Text}
-          {:name "category_id", :base_type :type/Integer}
+          {:name "category_id", :base_type (data/expected-base-type->actual :type/Integer)}
           {:name "latitude",    :base_type :type/Float}
           {:name "longitude",   :base_type :type/Float}
-          {:name "price",       :base_type :type/Integer}]}
-  (rows+cols
-    (qp/process-query
-      {:database (data/id)
-       :type     :query
-       :query    {:source-query {:source-table (data/id :venues)
-                                 :order-by     [:asc (data/id :venues :id)]
-                                 :limit        10}
-                  :limit        5}})))
+          {:name "price",       :base_type (data/expected-base-type->actual :type/Integer)}]}
+  (format-rows-by [int str int (partial u/round-to-decimals 4) (partial u/round-to-decimals 4) int]
+    (rows+cols
+      (qp/process-query
+        {:database (data/id)
+         :type     :query
+         :query    {:source-query {:source-table (data/id :venues)
+                                   :order-by     [:asc (data/id :venues :id)]
+                                   :limit        10}
+                    :limit        5}}))))
 
+;; TODO - `identifier`, `quoted-identifier` might belong in some sort of shared util namespace
 (defn- identifier
-  "Return a properly formatted identifier for a Table or Field.
+  "Return a properly formatted *UNQUOTED* identifier for a Table or Field.
   (This handles DBs like H2 who require uppercase identifiers, or databases like Redshift do clever hacks
    like prefixing table names with a unique schema for each test run because we're not
    allowed to create new databases.)"
-  ([table-kw]
+  (^String [table-kw]
    (let [{schema :schema, table-name :name} (db/select-one [Table :name :schema] :id (data/id table-kw))]
      (name (hsql/qualify schema table-name))))
-  ([table-kw field-kw]
+  (^String [table-kw field-kw]
    (db/select-one-field :name Field :id (data/id table-kw field-kw))))
 
+(defn- quote-identifier [identifier]
+  (first (hsql/format (keyword identifier)
+           :quoting (generic-sql/quote-style datasets/*driver*))))
+
+(def ^:private ^{:arglists '([table-kw] [table-kw field-kw])} ^String quoted-identifier
+  "Return a *QUOTED* identifier for a Table or Field. (This behaves just like `identifier`, but quotes the result)."
+  (comp quote-identifier identifier))
+
 ;; make sure we can do a basic query with a SQL source-query
-(datasets/expect-with-engines (engines-that-support :nested-queries)
+(datasets/expect-with-engines (non-timeseries-engines-with-feature :nested-queries)
   {:rows [[1 -165.374  4 3 "Red Medicine"                 10.0646]
           [2 -118.329 11 2 "Stout Burgers & Beers"        34.0996]
           [3 -118.428 11 2 "The Apple Pan"                34.0406]
@@ -70,24 +89,26 @@
           [5 -118.261 20 2 "Brite Spot Family Restaurant" 34.0778]]
    :cols [{:name "id",          :base_type :type/Integer}
           {:name "longitude",   :base_type :type/Float}
-          {:name "category_id", :base_type :type/Integer}
-          {:name "price",       :base_type :type/Integer}
+          {:name "category_id", :base_type (data/expected-base-type->actual :type/Integer)}
+          {:name "price",       :base_type (data/expected-base-type->actual :type/Integer)}
           {:name "name",        :base_type :type/Text}
           {:name "latitude",    :base_type :type/Float}]}
-  (rows+cols
-    (qp/process-query
-      {:database (data/id)
-       :type     :query
-       :query    {:source-query {:native (format "SELECT %s, %s, %s, %s, %s, %s FROM %s"
-                                                 (identifier :venues :id)
-                                                 (identifier :venues :longitude)
-                                                 (identifier :venues :category_id)
-                                                 (identifier :venues :price)
-                                                 (identifier :venues :name)
-                                                 (identifier :venues :latitude)
-                                                 (identifier :venues))}
-                  :order-by     [:asc [:field-literal (keyword (data/format-name :id)) :type/Integer]]
-                  :limit        5}})))
+  (format-rows-by [int (partial u/round-to-decimals 4) int int str (partial u/round-to-decimals 4)]
+    (rows+cols
+      (qp/process-query
+        {:database (data/id)
+         :type     :query
+         :query    {:source-query {:native (format "SELECT %s, %s, %s, %s, %s, %s FROM %s"
+                                                   (quoted-identifier :venues :id)
+                                                   (quoted-identifier :venues :longitude)
+                                                   (quoted-identifier :venues :category_id)
+                                                   (quoted-identifier :venues :price)
+                                                   (quoted-identifier :venues :name)
+                                                   (quoted-identifier :venues :latitude)
+                                                   (quoted-identifier :venues))}
+                    :order-by     [:asc [:field-literal (keyword (data/format-name :id)) :type/Integer]]
+                    :limit        5}}))))
+
 
 (def ^:private ^:const breakout-results
   {:rows [[1 22]
@@ -98,7 +119,7 @@
           {:name "count", :base_type :type/Integer}]})
 
 ;; make sure we can do a query with breakout and aggregation using an MBQL source query
-(datasets/expect-with-engines (engines-that-support :nested-queries)
+(datasets/expect-with-engines (non-timeseries-engines-with-feature :nested-queries)
   breakout-results
   (rows+cols
     (format-rows-by [int int]
@@ -110,14 +131,14 @@
                     :breakout     [[:field-literal (keyword (data/format-name :price)) :type/Integer]]}}))))
 
 ;; make sure we can do a query with breakout and aggregation using a SQL source query
-(datasets/expect-with-engines (engines-that-support :nested-queries)
+(datasets/expect-with-engines (non-timeseries-engines-with-feature :nested-queries)
   breakout-results
   (rows+cols
     (format-rows-by [int int]
       (qp/process-query
         {:database (data/id)
          :type     :query
-         :query    {:source-query {:native (format "SELECT * FROM %s" (identifier :venues))}
+         :query    {:source-query {:native (format "SELECT * FROM %s" (quoted-identifier :venues))}
                     :aggregation  [:count]
                     :breakout     [[:field-literal (keyword (data/format-name :price)) :type/Integer]]}}))))
 
@@ -163,6 +184,32 @@
   (tt/with-temp Card [card {:dataset_query {:database (data/id)
                                             :type     :native
                                             :native   {:query "SELECT * FROM VENUES"}}}]
+    (rows+cols
+      (format-rows-by [int int]
+        (qp/process-query
+          (query-with-source-card card
+            :aggregation [:count]
+            :breakout    [[:field-literal (keyword (data/format-name :price)) :type/Integer]]))))))
+
+;; Ensure trailing comments are trimmed and don't cause a wrapping SQL query to fail
+(expect
+  breakout-results
+  (tt/with-temp Card [card {:dataset_query {:database (data/id)
+                                            :type     :native
+                                            :native   {:query "SELECT * FROM VENUES -- small comment here"}}}]
+    (rows+cols
+      (format-rows-by [int int]
+        (qp/process-query
+          (query-with-source-card card
+            :aggregation [:count]
+            :breakout    [[:field-literal (keyword (data/format-name :price)) :type/Integer]]))))))
+
+;; Ensure trailing comments followed by a newline are trimmed and don't cause a wrapping SQL query to fail
+(expect
+  breakout-results
+  (tt/with-temp Card [card {:dataset_query {:database (data/id)
+                                            :type     :native
+                                            :native   {:query "SELECT * FROM VENUES -- small comment here\n"}}}]
     (rows+cols
       (format-rows-by [int int]
         (qp/process-query
@@ -396,7 +443,7 @@
       results-metadata))
 
 ;; make sure using a time interval filter works
-(datasets/expect-with-engines (engines-that-support :nested-queries)
+(datasets/expect-with-engines (non-timeseries-engines-with-feature :nested-queries)
   :completed
   (tt/with-temp Card [card (mbql-card-def
                              :source-table (data/id :checkins))]
@@ -406,7 +453,7 @@
         :status)))
 
 ;; make sure that wrapping a field literal in a datetime-field clause works correctly in filters & breakouts
-(datasets/expect-with-engines (engines-that-support :nested-queries)
+(datasets/expect-with-engines (non-timeseries-engines-with-feature :nested-queries)
   :completed
   (tt/with-temp Card [card (mbql-card-def
                              :source-table (data/id :checkins))]
@@ -431,3 +478,77 @@
                         "2014-05-01T00:00:00-07:00"])
         qp/process-query
         :status)))
+
+;; Make sure that macro expansion works inside of a neested query, when using a compound filter clause (#5974)
+(expect
+  [[22]]
+  (tt/with-temp* [Segment [segment {:table_id   (data/id :venues)
+                                    :definition {:filter [:= (data/id :venues :price) 1]}}]
+                  Card    [card (mbql-card-def
+                                  :source-table (data/id :venues)
+                                  :filter       [:and [:segment (u/get-id segment)]])]]
+    (-> (query-with-source-card card
+          :aggregation [:count])
+        qp/process-query
+        rows)))
+
+
+;; Make suer you're allowed to save a query that uses a SQL-based source query even if you don't have SQL *write*
+;; permissions (#6845)
+
+;; Check that write perms for a Card with a source query require that you are able to *read* (i.e., view) the source
+;; query rather than be able to write (i.e., save) it. For example you should be able to save a query that uses a
+;; native query as its source query if you have permissions to view that query, even if you aren't allowed to create
+;; new ad-hoc SQL queries yourself.
+(expect
+ #{(perms/native-read-path (data/id))}
+ (tt/with-temp Card [card {:dataset_query {:database (data/id)
+                                           :type     :native
+                                           :native   {:query "SELECT * FROM VENUES"}}}]
+   (card/query-perms-set (query-with-source-card card :aggregation [:count]) :write)))
+
+;; try this in an end-to-end fashion using the API and make sure we can save a Card if we have appropriate read
+;; permissions for the source query
+(defn- do-with-temp-copy-of-test-db
+  "Run `f` with a temporary Database that copies the details from the standard test database. `f` is invoked as `(f
+  db)`."
+  [f]
+  (data/with-db (data/get-or-create-database! defs/test-data)
+    (create-users-if-needed!)
+    (tt/with-temp Database [db {:details (:details (data/db)), :engine "h2"}]
+      (f db))))
+
+(defn- save-card-via-API-with-native-source-query!
+  "Attempt to save a Card that uses a native source query for Database with `db-id` via the API using Rasta. Use this to
+  test how the API endpoint behaves based on certain permissions grants for the `All Users` group."
+  [expected-status-code db-id]
+  (tt/with-temp Card [card {:dataset_query {:database db-id
+                                            :type     :native
+                                            :native   {:query "SELECT * FROM VENUES"}}}]
+    ((user->client :rasta) :post expected-status-code "card"
+     {:name                   (tu/random-name)
+      :display                "scalar"
+      :visualization_settings {}
+      :dataset_query          (query-with-source-card card
+                                :aggregation [:count])})))
+
+;; ok... grant native *read* permissions which means we should be able to view our source query generated with the
+;; function above. API should allow use to save here because write permissions for a query require read permissions
+;; for any source queries
+(expect
+  :ok
+  (do-with-temp-copy-of-test-db
+   (fn [db]
+     (perms/revoke-permissions! (perms-group/all-users) (u/get-id db))
+     (perms/grant-permissions! (perms-group/all-users) (perms/native-read-path (u/get-id db)))
+     (save-card-via-API-with-native-source-query! 200 (u/get-id db))
+     :ok)))
+
+;; however, if we do *not* have read permissions for the source query, we shouldn't be allowed to save the query. This
+;; API call should fail
+(expect
+  "You don't have permissions to do that."
+  (do-with-temp-copy-of-test-db
+   (fn [db]
+     (perms/revoke-permissions! (perms-group/all-users) (u/get-id db))
+     (save-card-via-API-with-native-source-query! 403 (u/get-id db)))))

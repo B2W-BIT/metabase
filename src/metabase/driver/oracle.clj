@@ -14,6 +14,10 @@
              [honeysql-extensions :as hx]
              [ssh :as ssh]]))
 
+(defrecord OracleDriver []
+  clojure.lang.Named
+  (getName [_] "Oracle"))
+
 (def ^:private ^:const pattern->type
   [;; Any types -- see http://docs.oracle.com/cd/B28359_01/server.111/b28286/sql_elements001.htm#i107578
    [#"ANYDATA"     :type/*]  ; Instance of a given type with data plus a description of the type (?)
@@ -74,7 +78,7 @@
   "Apply truncation / extraction to a date field or value for Oracle."
   [unit v]
   (case unit
-    :default         (hx/->date v)
+    :default         (some-> v hx/->date)
     :minute          (trunc :mi v)
     ;; you can only extract minute + hour from TIMESTAMPs, even though DATEs still have them (WTF), so cast first
     :minute-of-hour  (hsql/call :extract :minute (hx/->timestamp v))
@@ -126,8 +130,54 @@
                                                       :milliseconds (hx// field-or-value (hsql/raw 1000))))))
 
 
-;; Oracle doesn't support `LIMIT n` syntax. Instead we have to use `WHERE ROWNUM <= n` (`NEXT n ROWS ONLY` isn't supported on Oracle versions older than 12).
-;; This has to wrap the actual query, e.g.
+(defn- increment-identifier-suffix
+  "Add an appropriate suffix to a keyword IDENTIFIER to make it distinct from previous usages of the same identifier,
+  e.g.
+
+     (increment-identifier-suffix :my_col)   ; -> :my_col_2
+     (increment-identifier-suffix :my_col_2) ; -> :my_col_3"
+  [identifier]
+  (keyword
+   (let [identifier (name identifier)]
+     (if-let [[_ existing-suffix] (re-find #"^.*_(\d+$)" identifier)]
+       ;; if identifier already has an alias like col_2 then increment it to col_3
+       (let [new-suffix (str (inc (Integer/parseInt existing-suffix)))]
+         (clojure.string/replace identifier (re-pattern (str existing-suffix \$)) new-suffix))
+       ;; otherwise just stick a _2 on the end so it's col_2
+       (str identifier "_2")))))
+
+(defn- alias-everything
+  "Make sure all the columns in SELECT-CLAUSE are alias forms, e.g. `[:table.col :col]` instead of `:table.col`.
+   (This faciliates our deduplication logic.)"
+  [select-clause]
+  (for [col select-clause]
+    (if (sequential? col)
+      ;; if something's already an alias form like [:table.col :col] it's g2g
+      col
+      ;; otherwise if it's something like :table.col replace with [:table.col :col]
+      [col (keyword (last (clojure.string/split (name col) #"\.")))])))
+
+(defn- deduplicate-identifiers
+  "Make sure every column in SELECT-CLAUSE has a unique alias.
+   This is done because Oracle can't figure out how to use a query
+  that produces duplicate columns in a subselect."
+  [select-clause]
+  (if (= select-clause [:*])
+    ;; if we're doing `SELECT *` there's no way we can deduplicate anything so we're SOL, return as-is
+    select-clause
+    ;; otherwise we can actually deduplicate things
+    (loop [already-seen #{}, acc [], [[col alias] & more] (alias-everything select-clause)]
+      (cond
+        ;; if not more cols are left to deduplicate, we're done
+        (not col)                      acc
+        ;; otherwise if we've already used this alias, replace it with one like `identifier_2` and try agan
+        (contains? already-seen alias) (recur already-seen acc (cons [col (increment-identifier-suffix alias)]
+                                                                     more))
+        ;; otherwise if we haven't seen it record it as seen and move on to the next column
+        :else                          (recur (conj already-seen alias) (conj acc [col alias]) more)))))
+
+;; Oracle doesn't support `LIMIT n` syntax. Instead we have to use `WHERE ROWNUM <= n` (`NEXT n ROWS ONLY` isn't
+;; supported on Oracle versions older than 12). This has to wrap the actual query, e.g.
 ;;
 ;; SELECT *
 ;; FROM (
@@ -136,6 +186,9 @@
 ;;     ORDER BY employee_id
 ;; )
 ;; WHERE ROWNUM < 10;
+;;
+;; This wrapping can cause problems if there is an ambiguous column reference in the nested query (i.e. two columns
+;; with the same alias name). To ensure that doesn't happen, those column references need to be disambiguated first
 ;;
 ;; To do an offset we have to do something like:
 ;;
@@ -156,7 +209,9 @@
 (defn- apply-limit [honeysql-query {value :limit}]
   {:pre [(integer? value)]}
   {:select [:*]
-   :from   [honeysql-query]
+   :from   [(-> (merge {:select [:*]} ; if `honeysql-query` doesn't have a `SELECT` clause yet (which might be the case when using a source query)
+                       honeysql-query); fall back to including a `SELECT *` just to make sure a valid query is produced
+                (update :select deduplicate-identifiers))]
    :where  [:<= (hsql/raw "rownum") value]})
 
 (defn- apply-page [honeysql-query {{:keys [items page]} :page}]
@@ -167,17 +222,17 @@
       ;; if we need to do an offset we have to do double-nesting
       {:select [:*]
        :from   [{:select [:__table__.* [(hsql/raw "rownum") :__rownum__]]
-                 :from   [[honeysql-query :__table__]]
+                 :from   [[(merge {:select [:*]}
+                                  honeysql-query)
+                           :__table__]]
                  :where  [:<= (hsql/raw "rownum") (+ offset items)]}]
        :where  [:> :__rownum__ offset]})))
 
 
 ;; Oracle doesn't support `TRUE`/`FALSE`; use `1`/`0`, respectively; convert these booleans to numbers.
-(defn- prepare-value [{value :value}]
-  (cond
-    (true? value)  1
-    (false? value) 0
-    :else          value))
+(defmethod sqlqp/->honeysql [OracleDriver Boolean]
+  [_ bool]
+  (if bool 1 0))
 
 (defn- string-length-fn [field-key]
   (hsql/call :length field-key))
@@ -200,10 +255,8 @@
     "You must specify the SID and/or the Service Name."
     message))
 
-
-(defrecord OracleDriver []
-  clojure.lang.Named
-  (getName [_] "Oracle"))
+(def ^:private oracle-date-formatters (driver/create-db-time-formatters "yyyy-MM-dd HH:mm:ss.SSS zzz"))
+(def ^:private oracle-db-time-query "select to_char(current_timestamp, 'YYYY-MM-DD HH24:MI:SS.FF3 TZD') FROM DUAL")
 
 (u/strict-extend OracleDriver
   driver/IDriver
@@ -233,7 +286,8 @@
                                                              :type         :password
                                                              :placeholder  "*******"}]))
           :execute-query                     (comp remove-rownum-column sqlqp/execute-query)
-          :humanize-connection-error-message (u/drop-first-arg humanize-connection-error-message)})
+          :humanize-connection-error-message (u/drop-first-arg humanize-connection-error-message)
+          :current-db-time                   (driver/make-current-db-time-fn oracle-db-time-query oracle-date-formatters)})
 
   sql/ISQLDriver
   (merge (sql/ISQLDriverDefaultsMixin)
@@ -246,7 +300,9 @@
           :excluded-schemas          (fn [& _]
                                        (set/union
                                         #{"ANONYMOUS"
-                                          "APEX_040200" ; TODO - are there othere APEX tables we want to skip? Maybe we should make this a pattern instead? (#"^APEX_")
+                                          ;; TODO - are there othere APEX tables we want to skip? Maybe we should make
+                                          ;; this a pattern instead? (#"^APEX_")
+                                          "APEX_040200"
                                           "APPQOSSYS"
                                           "AUDSYS"
                                           "CTXSYS"
@@ -271,21 +327,24 @@
                                           "XDB"
                                           "XS$NULL"}
                                         (when config/is-test?
-                                          ;; DIRTY HACK (!) This is similar hack we do for Redshift, see the explanation there
-                                          ;; we just want to ignore all the test "session schemas" that don't match the current test
+                                          ;; DIRTY HACK (!) This is similar hack we do for Redshift, see the
+                                          ;; explanation there we just want to ignore all the test "session schemas"
+                                          ;; that don't match the current test
                                           (require 'metabase.test.data.oracle)
                                           ((resolve 'metabase.test.data.oracle/non-session-schemas)))))
-          :field-percent-urls        sql/slow-field-percent-urls
           :set-timezone-sql          (constantly "ALTER session SET time_zone = %s")
-          :prepare-value             (u/drop-first-arg prepare-value)
           :string-length-fn          (u/drop-first-arg string-length-fn)
           :unix-timestamp->timestamp (u/drop-first-arg unix-timestamp->timestamp)}))
 
-;; only register the Oracle driver if the JDBC driver is available
-(when (u/ignore-exceptions
-        (Class/forName "oracle.jdbc.OracleDriver"))
-  ;; By default the Oracle JDBC driver isn't compliant with JDBC standards -- instead of returning types like java.sql.Timestamp
-  ;; it returns wacky types like oracle.sql.TIMESTAMPT. By setting this System property the JDBC driver will return the appropriate types.
-  ;; See this page for more details: http://docs.oracle.com/database/121/JJDBC/datacc.htm#sthref437
-  (.setProperty (System/getProperties) "oracle.jdbc.J2EE13Compliant" "TRUE")
-  (driver/register-driver! :oracle (OracleDriver.)))
+(defn -init-driver
+  "Register the oracle driver when the JAR is found on the classpath"
+  []
+  ;; only register the Oracle driver if the JDBC driver is available
+  (when (u/ignore-exceptions
+         (Class/forName "oracle.jdbc.OracleDriver"))
+    ;; By default the Oracle JDBC driver isn't compliant with JDBC standards -- instead of returning types like
+    ;; java.sql.Timestamp it returns wacky types like oracle.sql.TIMESTAMPT. By setting this System property the JDBC
+    ;; driver will return the appropriate types. See this page for more details:
+    ;; http://docs.oracle.com/database/121/JJDBC/datacc.htm#sthref437
+    (.setProperty (System/getProperties) "oracle.jdbc.J2EE13Compliant" "TRUE")
+    (driver/register-driver! :oracle (OracleDriver.))))

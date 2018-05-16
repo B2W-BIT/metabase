@@ -6,14 +6,13 @@
              [driver :as driver]
              [query-processor :as qp]
              [query-processor-test :refer [rows]]]
+            [metabase.driver.mongo :as mongo]
+            [metabase.driver.mongo.query-processor :as mongo-qp]
             [metabase.models
              [field :refer [Field]]
-             [field-values :refer [FieldValues]]
              [table :as table :refer [Table]]]
-            [metabase.query-processor.expand :as ql]
-            [metabase.test
-             [data :as data]
-             [util :as tu]]
+            [metabase.query-processor.middleware.expand :as ql]
+            [metabase.test.data :as data]
             [metabase.test.data
              [datasets :as datasets]
              [interface :as i]]
@@ -78,7 +77,8 @@
    :row_count 1
    :data      {:rows        [[1]]
                :columns     ["count"]
-               :cols        [{:name "count", :display_name "Count", :base_type :type/Integer}]
+               :cols        [{:name "count", :display_name "Count", :base_type :type/Integer
+                              :remapped_to nil, :remapped_from nil}]
                :native_form {:collection "venues"
                              :query      native-query}}}
   (-> (qp/process-query {:native   {:query      native-query
@@ -101,39 +101,51 @@
 (datasets/expect-with-engine :mongo
   {:schema nil
    :name   "venues"
-   :fields #{{:name "name"
-              :base-type :type/Text}
-             {:name "latitude"
-              :base-type :type/Float}
-             {:name "longitude"
-              :base-type :type/Float}
-             {:name "price"
-              :base-type :type/Integer}
-             {:name "category_id"
-              :base-type :type/Integer}
-             {:name "_id"
-              :base-type :type/Integer
-              :pk? true}}}
+   :fields #{{:name          "name"
+              :database-type "java.lang.String"
+              :base-type     :type/Text}
+             {:name          "latitude"
+              :database-type "java.lang.Double"
+              :base-type     :type/Float}
+             {:name          "longitude"
+              :database-type "java.lang.Double"
+              :base-type     :type/Float}
+             {:name          "price"
+              :database-type "java.lang.Long"
+              :base-type     :type/Integer}
+             {:name          "category_id"
+              :database-type "java.lang.Long"
+              :base-type     :type/Integer}
+             {:name          "_id"
+              :database-type "java.lang.Long"
+              :base-type     :type/Integer
+              :pk?           true}}}
   (driver/describe-table (MongoDriver.) (data/db) (Table (data/id :venues))))
 
-;; ANALYZE-TABLE
+
+;;; table-rows-sample
 (datasets/expect-with-engine :mongo
-  {:row_count 100
-   :fields    [{:id (data/id :venues :category_id) :values [2 3 4 5 6 7 10 11 12 13 14 15 18 19 20 29 40 43 44 46 48 49 50 58 64 67 71 74]}
-               {:id (data/id :venues :name),       :values (db/select-one-field :values FieldValues, :field_id (data/id :venues :name))}
-               {:id (data/id :venues :price),      :values [1 2 3 4]}]}
-  (let [venues-table (Table (data/id :venues))]
-    (driver/analyze-table (MongoDriver.) venues-table (set (mapv :id (table/fields venues-table))))))
+  [[1 "Red Medicine"]
+   [2 "Stout Burgers & Beers"]
+   [3 "The Apple Pan"]
+   [4 "Wurstküche"]
+   [5 "Brite Spot Family Restaurant"]]
+  (driver/sync-in-context (MongoDriver.) (data/db)
+    (fn []
+      (vec (take 5 (driver/table-rows-sample (Table (data/id :venues))
+                     [(Field (data/id :venues :id))
+                      (Field (data/id :venues :name))]))))))
+
 
 ;; ## Big-picture tests for the way data should look post-sync
 
 ;; Test that Tables got synced correctly, and row counts are correct
 (datasets/expect-with-engine :mongo
-  [{:rows 75,   :active true, :name "categories"}
-   {:rows 1000, :active true, :name "checkins"}
-   {:rows 15,   :active true, :name "users"}
-   {:rows 100,  :active true, :name "venues"}]
-  (for [field (db/select [Table :name :active :rows]
+  [{:active true, :name "categories"}
+   {:active true, :name "checkins"}
+   {:active true, :name "users"}
+   {:active true, :name "venues"}]
+  (for [field (db/select [Table :name :active]
                 :db_id (data/id)
                 {:order-by [:name]})]
     (into {} field)))
@@ -145,7 +157,7 @@
    [{:special_type :type/PK,        :base_type :type/Integer,  :name "_id"}
     {:special_type nil,             :base_type :type/DateTime, :name "date"}
     {:special_type :type/Category,  :base_type :type/Integer,  :name "user_id"}
-    {:special_type :type/Category,  :base_type :type/Integer,  :name "venue_id"}]
+    {:special_type nil,             :base_type :type/Integer,  :name "venue_id"}]
    [{:special_type :type/PK,        :base_type :type/Integer,  :name "_id"}
     {:special_type nil,             :base_type :type/DateTime, :name "last_login"}
     {:special_type :type/Name,      :base_type :type/Text,     :name "name"}
@@ -166,11 +178,11 @@
 
 ;;; Check that we support Mongo BSON ID and can filter by it (#1367)
 (i/def-database-definition ^:private with-bson-ids
-  ["birds"
-   [{:field-name "name", :base-type :type/Text}
-    {:field-name "bird_id", :base-type :type/MongoBSONID}]
-   [["Rasta Toucan" (ObjectId. "012345678901234567890123")]
-    ["Lucky Pigeon" (ObjectId. "abcdefabcdefabcdefabcdef")]]])
+  [["birds"
+     [{:field-name "name", :base-type :type/Text}
+      {:field-name "bird_id", :base-type :type/MongoBSONID}]
+     [["Rasta Toucan" (ObjectId. "012345678901234567890123")]
+      ["Lucky Pigeon" (ObjectId. "abcdefabcdefabcdefabcdef")]]]])
 
 (datasets/expect-with-engine :mongo
   [[2 "Lucky Pigeon" (ObjectId. "abcdefabcdefabcdefabcdef")]]
@@ -179,38 +191,38 @@
             (ql/filter (ql/= $bird_id "abcdefabcdefabcdefabcdef"))))))
 
 
-;;; ------------------------------------------------------------ Test that we can handle native queries with "ISODate(...)" and "ObjectId(...) forms (#3741, #4448) ------------------------------------------------------------
-(tu/resolve-private-vars metabase.driver.mongo.query-processor
-  maybe-decode-fncall decode-fncalls encode-fncalls)
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                             ISODate(...) AND ObjectId(...) HANDLING (#3741, #4448)                             |
+;;; +----------------------------------------------------------------------------------------------------------------+
 
 (expect
   "[{\"$match\":{\"date\":{\"$gte\":[\"___ISODate\", \"2012-01-01\"]}}}]"
-  (encode-fncalls "[{\"$match\":{\"date\":{\"$gte\":ISODate(\"2012-01-01\")}}}]"))
+  (#'mongo-qp/encode-fncalls "[{\"$match\":{\"date\":{\"$gte\":ISODate(\"2012-01-01\")}}}]"))
 
 (expect
   "[{\"$match\":{\"entityId\":{\"$eq\":[\"___ObjectId\", \"583327789137b2700a1621fb\"]}}}]"
-  (encode-fncalls "[{\"$match\":{\"entityId\":{\"$eq\":ObjectId(\"583327789137b2700a1621fb\")}}}]"))
+  (#'mongo-qp/encode-fncalls "[{\"$match\":{\"entityId\":{\"$eq\":ObjectId(\"583327789137b2700a1621fb\")}}}]"))
 
 ;; make sure fn calls with no arguments work as well (#4996)
 (expect
   "[{\"$match\":{\"date\":{\"$eq\":[\"___ISODate\"]}}}]"
-  (encode-fncalls "[{\"$match\":{\"date\":{\"$eq\":ISODate()}}}]"))
+  (#'mongo-qp/encode-fncalls "[{\"$match\":{\"date\":{\"$eq\":ISODate()}}}]"))
 
 (expect
   (DateTime. "2012-01-01")
-  (maybe-decode-fncall ["___ISODate" "2012-01-01"]))
+  (#'mongo-qp/maybe-decode-fncall ["___ISODate" "2012-01-01"]))
 
 (expect
   (ObjectId. "583327789137b2700a1621fb")
-  (maybe-decode-fncall ["___ObjectId" "583327789137b2700a1621fb"]))
+  (#'mongo-qp/maybe-decode-fncall ["___ObjectId" "583327789137b2700a1621fb"]))
 
 (expect
   [{:$match {:date {:$gte (DateTime. "2012-01-01")}}}]
-  (decode-fncalls [{:$match {:date {:$gte ["___ISODate" "2012-01-01"]}}}]))
+  (#'mongo-qp/decode-fncalls [{:$match {:date {:$gte ["___ISODate" "2012-01-01"]}}}]))
 
 (expect
   [{:$match {:entityId {:$eq (ObjectId. "583327789137b2700a1621fb")}}}]
-  (decode-fncalls [{:$match {:entityId {:$eq ["___ObjectId" "583327789137b2700a1621fb"]}}}]))
+  (#'mongo-qp/decode-fncalls [{:$match {:entityId {:$eq ["___ObjectId" "583327789137b2700a1621fb"]}}}]))
 
 (datasets/expect-with-engine :mongo
   5
@@ -226,3 +238,14 @@
                                              :collection "venues"}
                                   :type     :native
                                   :database (data/id)}))))
+
+
+;; tests for `most-common-object-type`
+(expect
+  String
+  (#'mongo/most-common-object-type [[Float 20] [Integer 10] [String 30]]))
+
+;; make sure it handles `nil` types correctly as well (#6880)
+(expect
+  nil
+  (#'mongo/most-common-object-type [[Float 20] [nil 40] [Integer 10] [String 30]]))

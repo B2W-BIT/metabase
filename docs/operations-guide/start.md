@@ -3,7 +3,6 @@
 
 *  [How to install Metabase](#installing-and-running-metabase)
 *  [How to upgrade Metabase](#upgrading-metabase)
-*  [Tips for troubleshooting various issues](#troubleshooting-common-problems)
 *  [Configuring the application database](#configuring-the-metabase-application-database)
 *  [Migrating from using the H2 database to MySQL or Postgres](#migrating-from-using-the-h2-database-to-mysql-or-postgres)
 *  [Running database migrations manually](#running-metabase-database-migrations-manually)
@@ -13,6 +12,9 @@
 *  [Changing password complexity](#changing-metabase-password-complexity)
 *  [Handling Timezones](#handling-timezones-in-metabase)
 *  [Configuring Emoji Logging](#configuring-emoji-logging)
+*  [Configuring Logging Level](#configuring-logging-level)
+*  [How to setup monitoring via JMX](#monitoring-via-jmx)
+*  [A word on Java versions](#java-versions)
 
 # Installing and Running Metabase
 
@@ -27,9 +29,6 @@ Metabase provides a binary Mac OS X application for users who are interested in 
 #### [Running on Docker](running-metabase-on-docker.md)
 If you are using Docker containers and prefer to manage your Metabase installation that way then we've got you covered.  This guide discusses how to use the Metabase Docker image to launch a container running Metabase.
 
-
-
-
 ### Cloud Platforms
 
 #### [Running on AWS Elastic Beanstalk](running-metabase-on-elastic-beanstalk.md)
@@ -41,9 +40,15 @@ Currently in beta.  We've run Metabase on Heroku and it works just fine, but it'
 #### [Running on Cloud66](running-metabase-on-cloud66.md)
 Community support only at this time, but we have reports of Metabase instances running on Cloud66!
 
+#### [Running on Debian as a service](running-metabase-on-debian.md)
+Community support only at this time, but learn how to deploy Metabase as a service on Debian (and Debian-based) systems. Simple, guided, step-by-step approach that will work on any VPS.
+
+#### [Running on Kubernetes](running-metabase-on-kubernetes.md)
+Community Helm chart for running Metabase on Kubernetes
+
 # Upgrading Metabase
 
-Before you attempt to upgrade Metabase, you should make a backup of the database just in case. While it is unlikely you will need to rollback, it will do wonders for your peace of mind.
+Before you attempt to upgrade Metabase, you should make a backup of the application database just in case. While it is unlikely you will need to roll back, it will do wonders for your peace of mind.
 
 How you upgrade Metabase depends on how you are running it. See below for information on how to update Metabase on managed platforms.
 
@@ -51,90 +56,22 @@ How you upgrade Metabase depends on how you are running it. See below for inform
 
 
 #### Docker Image
-If you are running it via docker, then you simply kill the docker process, and start a new container with the latest image. On startup, Metabase will perform any upgrade tasks it needs to perform, and once it is finished, you'll be running the new version.
+If you are running Metabase via docker, then you simply need to kill the Docker process and start a new container with the latest Metabase image. On startup, Metabase will perform any upgrade tasks it needs to perform, and once it's finished you'll be running the new version.
 
 #### Jar file
-If you are running the JVM Jar file directly, then you simply kill the process, and restart the server. On startup, Metabase will perform any upgrade tasks it needs to perform, and once it is finished, you'll be running the new version.
+If you are running the JVM Jar file directly, then you simply kill the process, replace the .jar file with the newer version and restart the server. On startup, Metabase will perform any upgrade tasks it needs to perform, and once it's finished you'll be running the new version.
 
 
-#### Mac OS X Application
-If you are using the Metabase app, you will be notified when there is a new version available. You will see a dialog displaying the changes in the latest version and prompt you to upgrade.
+#### macOS Application
+If you are using the Metabase macOS app, you will be notified when there is a new version available. You will see a dialog displaying the changes in the latest version and prompting you to upgrade.
 
 ![Autoupdate Confirmation Dialog](images/AutoupdateScreenshot.png)
 
-#### [Upgrading AWS Elastic Beanstalk deployments](running-metabase-on-elastic-beanstalk.md#deploying-new-versions-of-metabase)
+#### [Upgrading AWS Elastic Beanstalk deployments](running-metabase-on-elastic-beanstalk.html#deploying-new-versions-of-metabase)
 Step-by-step instructions on how to upgrade Metabase running on Elastic Beanstalk using RDS.
 
-#### [Upgrading Heroku deployments](running-metabase-on-heroku.md#deploying-new-versions-of-metabase)
+#### [Upgrading Heroku deployments](running-metabase-on-heroku.html#deploying-new-versions-of-metabase)
 Step-by-step instructions on how to upgrade Metabase running on Heroku.
-
-# Troubleshooting Common Problems
-
-### Metabase fails to start due to database locks
-
-Sometimes Metabase will fail to complete its startup due to a database lock that was not cleared properly. The error message will look something like:
-
-    liquibase.exception.DatabaseException: liquibase.exception.LockException: Could not acquire change log lock.
-
-When this happens, go to a terminal where Metabase is installed and run:
-
-    java -jar metabase.jar migrate release-locks
-
-in the command line to manually clear the locks. Then restart your Metabase instance.
-
-### Metabase fails to start due to PermGen OutOfMemoryErrors
-
-On Java 7, Metabase may fail to launch with a message like
-
-    java.lang.OutOfMemoryError: PermGen space
-
-or one like
-
-    Exception: java.lang.OutOfMemoryError thrown from the UncaughtExceptionHandler
-
-If this happens, setting a few JVM options should fix your issue:
-
-    java -XX:+CMSClassUnloadingEnabled -XX:+UseConcMarkSweepGC -XX:MaxPermSize=256m -jar target/uberjar/metabase.jar
-
-You can also pass JVM arguments by setting the environment variable `JAVA_TOOL_OPTIONS`, e.g.
-
-    JAVA_TOOL_OPTIONS='-XX:+CMSClassUnloadingEnabled -XX:+UseConcMarkSweepGC -XX:MaxPermSize=256m'
-
-Alternatively, you can upgrade to Java 8 instead, which will fix the issue as well.
-
-### Metabase fails to start due to Heap Space OutOfMemoryErrors
-
-Normally, the JVM can figure out how much RAM is available on the system and automatically set a sensible upper bound for heap memory usage. On certain shared hosting
-environments, however, this doesn't always work perfectly. If Metabase fails to start with an error message like
-
-    java.lang.OutOfMemoryError: Java heap space
-
-You'll just need to set a JVM option to let it know explicitly how much memory it should use for the heap space:
-
-    java -Xmx2g -jar metabase.jar
-
-Adjust this number as appropriate for your shared hosting instance. Make sure to set the number lower than the total amount of RAM available on your instance, because Metabase isn't the only process that'll be running. Generally, leaving 1-2 GB of RAM for these other processes should be enough; for example, you might set `-Xmx` to `1g` for an instance with 2 GB of RAM, `2g` for one with 4 GB of RAM, `6g` for an instance with 8 GB of RAM, and so forth. You may need to experment with these settings a bit to find the right number.
-
-As above, you can use the environment variable `JAVA_TOOL_OPTIONS` to set JVM args instead of passing them directly to `java`. This is useful when running the Docker image,
-for example.
-
-    docker run -d -p 3000:3000 -e "JAVA_TOOL_OPTIONS=-Xmx2g" metabase/metabase
-
-### Metabase fails to connect to H2 Database on Windows 10
-
-In some situations the Metabase JAR needs to be unblocked so it has permissions to create local files for the application database.
-
-On Windows 10, if you see an error message like
-
-    Exception in thread "main" java.lang.AssertionError: Assert failed: Unable to connect to Metabase DB.
-
-when running the JAR, you can unblock the file by right-clicking, clicking "Properties", and then clicking "Unblock".
-See Microsoft's documentation [here](https://blogs.msdn.microsoft.com/delay/p/unblockingdownloadedfile/) for more details on unblocking downloaded files.
-
-There are a few other reasons why Metabase might not be able to connect to your H2 DB. Metabase connects to the DB over a TCP port, and it's possible
-that something in your `ipconfig` configuration is blocking the H2 port. See the discussion [here](https://github.com/metabase/metabase/issues/1871) for
-details on how to resolve this issue.
-
 
 # Configuring the Metabase Application Database
 
@@ -145,6 +82,7 @@ The application database is where Metabase stores information about users, saved
 **NOTE:** currently Metabase does not provide automated support for migrating data from one application database to another, so if you start with H2 and then want to move to Postgres you'll have to dump the data from H2 and import it into Postgres before relaunching the application.
 
 #### [H2](http://www.h2database.com/) (default)
+
 To use the H2 database for your Metabase instance you don't need to do anything at all.  When the application is first launched it will attempt to create a new H2 database in the same filesystem location the application is launched from.
 
 You can see these database files from the terminal:
@@ -162,6 +100,7 @@ If for any reason you want to use an H2 database file in a separate location fro
     export MB_DB_FILE=/the/path/to/my/h2.db
     java -jar metabase.jar
 
+Note that H2 automatically appends `.mv.db` or `.h2.db` to the path you specify; do not include those in you path! In other words, `MB_DB_FILE` should be something like `/path/to/metabase.db`, rather than something like `/path/to/metabase.db.mv.db` (even though this is the file that actually gets created).
 
 #### [Postgres](http://www.postgresql.org/)
 
@@ -196,13 +135,13 @@ This will tell Metabase to look for its application database using the supplied 
 
 # Migrating from using the H2 database to MySQL or Postgres
 
-If you decide to use the default application database (H2) when you initially start using Metabase, but decide later that you'd like to switch to a more production ready database such as MySQL or Postgres we make the transition easy for you.
+If you decide to use the default application database (H2) when you initially start using Metabase, but later decide that you'd like to switch to a more production-ready database such as MySQL or Postgres, we make the transition easy for you.
 
 Metabase provides a custom migration command for upgrading H2 application database files by copying their data to a new database. Here's what you'll want to do:
 
 1. Shutdown your Metabase instance so that it's not running. This ensures no accidental data gets written to the db while migrating.
 2. Make a backup copy of your H2 application database by following the instructions in [Backing up Metabase Application Data](#backing-up-metabase-application-data). Safety first!
-3. Run the Metabase data migration command using the appropriate environment variables for the target database you want to migrate to.  You can find details about specifying MySQL and Postgres databases at [Configuring the application database](#configuring-the-metabase-application-database). Here's an example of migrating to Postgres.
+3. Run the Metabase data migration command using the appropriate environment variables for the target database you want to migrate to.  You can find details about specifying MySQL and Postgres databases at [Configuring the application database](#configuring-the-metabase-application-database). Here's an example of migrating to Postgres:
 
 ```
 export MB_DB_TYPE=postgres
@@ -211,20 +150,21 @@ export MB_DB_PORT=5432
 export MB_DB_USER=<username>
 export MB_DB_PASS=<password>
 export MB_DB_HOST=localhost
-java -jar metabase.jar load-from-h2 <path-to-metabase-h2-database-file>
+java -jar metabase.jar load-from-h2 /path/to/metabase.db # do not include .mv.db or .h2.db suffix
 ```
 
-It is expected that you will run the command against a brand new (empty!) database and Metabase will handle all of the work of creating the database schema and migrating the data for you.
+It is expected that you will run the command against a brand-new (empty!) database; Metabase will handle all of the work of creating the database schema and migrating the data for you.
 
 ###### Notes
 
-*  It is required that wherever you are running this migration command can connect to the target MySQL or Postgres database. So if you are attempting to move the data to a cloud database make sure you take that into consideration.
+*  It is required that you can connect to the target MySQL or Postgres database in whatever environment you are running this migration command in. So, if you are attempting to move the data to a cloud database, make sure you take that into consideration.
 *  The code that handles these migrations uses a Postgres SQL command that is only available in Postgres 9.4 or newer versions. Please make sure you Postgres database is version 9.4 or newer.
+*  H2 automatically adds a `.h2.db` or `.mv.db` extension to the database path you specify, so make sure the path to the DB file you pass to the command *does not* include it. For example, if you have a file named `/path/to/metabase.db.h2.db`, call the command with `load-from-h2 /path/to/metabase.db`.
 
 
 # Running Metabase database migrations manually
 
-When Metabase is starting up it will typically attempt to determine if any changes are required to the application database and it will execute those changes automatically.  If for some reason you wanted to see what these changes are and run them manually on your database then we let you do that.
+When Metabase is starting up, it will typically attempt to determine if any changes are required to the application database, and, if so, will execute those changes automatically.  If for some reason you wanted to see what these changes are and run them manually on your database then we let you do that.
 
 Simply set the following environment variable before launching Metabase:
 
@@ -377,3 +317,42 @@ By default Metabase will include emoji characters in logs. You can disable this 
 
     export MB_EMOJI_IN_LOGS="false"
     java -jar metabase.jar
+
+# Configuring Logging Level
+
+By default, Metabase logs quite a bit of information. Luckily, Metabase uses [Log4j](http://logging.apache.org/log4j) under the hood, meaning the logging is completely configurable.
+
+Metabase's default logging configuration can be found [here](https://github.com/metabase/metabase/blob/master/resources/log4j.properties). You can override this properties file and tell
+Metabase to use your own logging configuration file by passing a `-Dlog4j.configuration` argument when running Metabase:
+
+    java -Dlog4j.configuration=file:/path/to/custom/log4j.properties -jar metabase.jar
+
+The easiest way to get started customizing logging would be to use a copy of default `log4j.properties` file linked to above and adjust that to meet your needs. Keep in mind that you'll need to restart Metabase for changes to the file to take effect.
+
+# [Monitoring via JMX](enable-jmx.md)
+
+Diagnosing performance related issues can be a challenge. Luckily the JVM ships with tools that can help diagnose many common issues. Enabling JMX and using a tool like VisualVM can help diagnose issues related to running out of memory, a hung Metabase instance and slow response times. See [Monitoring via JMX](enable-jmx.md) for more information on setting this up.
+
+# Java Versions
+
+Metabase will run on Java version 7 or greater, but Java 8 is the easiest and most common chioce. Java 7 was End of Life'd by Oracle in April of 2015 and as such, *Metabase support for Java 7 has been deprecated*. Users are encouraged to upgrade to Java 8 as we will drop support for Java 7 in a future release. For more information on installing/upgrading a Windows or macOS system, see the [Oracle installation instructions](https://docs.oracle.com/javase/8/docs/technotes/guides/install/install_overview.html). Linux users likely find OpenJDK easier to install/upgrade, more information is available on [the OpenJDK install page](http://openjdk.java.net/install/).
+
+## Running on Java 7
+
+Running Metabase on Java version 7 requires additional arguments to the Java invocation:
+
+    java -XX:+CMSClassUnloadingEnabled -XX:+UseConcMarkSweepGC -XX:MaxPermSize=256m -jar metabase.jar
+
+Note that these extra arguments are not required on Java 8. *Support for Java 7 has been deprecated and users are encouraged to upgrade*.
+
+## Running on Java 8
+
+Running on Java 8 is the easiest path to running Metabase. There are no additional parameters required, if launching from a Jar the below invocation will work:
+
+    java -jar metabase.jar
+
+## Running on Java 9
+
+Java version 9 has introduced a new module system that places some additional restrictions on class loading. Metabase (and it's dependencies) still rely on the old behavior. Metabase runs on Java 9, but requires an additional argument to work around these changes in the module system:
+
+    java --add-opens=java.base/java.net=ALL-UNNAMED -jar metabase.jar
